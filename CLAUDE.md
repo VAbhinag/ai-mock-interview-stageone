@@ -17,7 +17,7 @@ working demo + being able to explain every design decision on camera.
 
 ## Stack
 - livekit-agents (1.x), livekit-plugins-tavus
-- - STT: deepgram (nova-3) | LLM: google gemini (gemini-2.0-flash) | TTS: cartesia
+- STT: deepgram (nova-3) | LLM: groq (llama-3.1-8b-instant) | TTS: elevenlabs (eleven_flash_v2_5)
 - VAD/turn detection: silero | resume parsing: pdfplumber
 - python-dotenv for secrets
 
@@ -53,3 +53,7 @@ working demo + being able to explain every design decision on camera.
 5. Prefer clear, commented code over cleverness - I need to explain it on video.
 6. Add lightweight logging for reply latency and stage transitions.
 7. Run the code yourself after each stage and fix your own errors before handing back.
+
+- Stage 2 note: hit free-tier limits on Cartesia TTS mid-build; pipeline is
+  provider-agnostic, swapped TTS to ElevenLabs. 8B model needed a leak-guard +
+  action-based prompt phrasing to stop it speaking the handoff tool call.
