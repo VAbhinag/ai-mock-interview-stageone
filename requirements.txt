@@ -1,6 +1,6 @@
 livekit-agents~=1.6
 livekit-plugins-deepgram~=1.6
 livekit-plugins-groq~=1.6
-livekit-plugins-cartesia~=1.6
+livekit-plugins-elevenlabs~=1.6
 livekit-plugins-silero~=1.6
 python-dotenv

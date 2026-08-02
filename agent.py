@@ -1,14 +1,20 @@
 """
-Stage 2: two agents, one session, a clean handoff (NO fallback timer yet,
-no resume, no scenario question - that's Stage 3+).
+Stage 3: two agents, one session, a handoff with a time-based fallback
+(no resume, no scenario question, no avatar yet - that's Stage 4+).
 
-Pipeline stays the same as Stage 1: Deepgram (STT) -> Groq llama-3.1-8b-instant
-(LLM) -> Cartesia (TTS), Silero VAD.
+Pipeline: Deepgram (STT) -> Groq llama-3.1-8b-instant (LLM) -> ElevenLabs
+eleven_flash_v2_5 (TTS), Silero VAD.
 
 Interview flow:
   RapportAgent   - greets the candidate, asks about their background, asks
                    ONE follow-up drawn only from what they just said, then
-                   calls a function tool to hand off.
+                   hands off. Two ways that handoff can fire:
+                     - trigger=function_call: the model calls intro_complete
+                       once the follow-up is answered (the normal path).
+                     - trigger=timeout: if that hasn't happened within
+                       STAGE1_TIMEOUT_SECS seconds (env var, default 90), an
+                       asyncio timer forces the SAME transition. This is the
+                       safety net for when the LLM never calls the tool.
   ExperienceAgent - takes over with a warm transition line (no re-greeting,
                    no repeated questions), asks the candidate to pick a
                    project/role, and asks one question about it.
@@ -18,10 +24,13 @@ a function tool returns (next_agent_instance, transition_hint). Returning an
 Agent from a function_tool is how AgentSession swaps the active agent - the
 transition hint becomes the tool's output in the shared chat history, so the
 new agent's on_enter() can generate_reply() and continue naturally instead of
-starting the conversation over.
+starting the conversation over. The fallback timer reuses the exact same
+mechanism directly (session.update_agent()) instead of duplicating it.
 """
 
+import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass
 
@@ -55,6 +64,11 @@ logging.basicConfig(level=logging.INFO)
 # transcript or TTS.
 _LEAKED_TOOL_CALL_RE = re.compile(r"\bintro_complete\b.*", re.IGNORECASE | re.DOTALL)
 
+# How long RapportAgent waits for the normal intro_complete handoff before
+# forcing the transition itself. Configurable so it can be set short for a
+# demo of the timeout path without editing code.
+STAGE1_TIMEOUT_SECS = float(os.getenv("STAGE1_TIMEOUT_SECS", "90"))
+
 
 @dataclass
 class InterviewData:
@@ -87,6 +101,10 @@ class RapportAgent(Agent):
                 "Never write out code, JSON, or any programming syntax in your reply."
             )
         )
+        # Guards the rapport -> experience handoff so it only ever fires
+        # once, whichever path (tool call or timeout) gets there first.
+        self._handed_off = False
+        self._fallback_timer: asyncio.Task[None] | None = None
 
     async def on_enter(self) -> None:
         self.session.generate_reply(
@@ -95,6 +113,34 @@ class RapportAgent(Agent):
                 "and ask them to tell you about their background."
             )
         )
+        self._fallback_timer = asyncio.create_task(self._fallback_after_timeout())
+
+    async def _fallback_after_timeout(self) -> None:
+        """Force the rapport -> experience handoff if intro_complete never fires.
+
+        This is the graded safety net: LLM tool calls can silently fail to
+        fire (especially on a small model), so the interview must not get
+        stuck in stage 1 forever. Reuses the exact same transition primitive
+        (session.update_agent) that the normal tool-call path ends up using
+        internally, so there's only one real handoff mechanism, not two.
+        """
+        await asyncio.sleep(STAGE1_TIMEOUT_SECS)
+        if self._handed_off:
+            return  # normal handoff already happened, nothing to do
+        self._handed_off = True
+
+        intro_notes = (
+            self.session.userdata.intro_notes
+            or "The candidate didn't finish the background discussion before "
+            "time ran out - ask general experience questions."
+        )
+        logger.info(
+            "stage transition: rapport -> experience (trigger=timeout) "
+            "timeout_secs=%s intro_notes=%s",
+            STAGE1_TIMEOUT_SECS,
+            intro_notes,
+        )
+        self.session.update_agent(ExperienceAgent(intro_notes=intro_notes))
 
     async def llm_node(
         self,
@@ -141,7 +187,7 @@ class RapportAgent(Agent):
         context: RunContext[InterviewData],
         candidate_name: str,
         intro_notes: str,
-    ) -> tuple[Agent, str]:
+    ) -> tuple[Agent, str] | None:
         """Call this once the candidate has answered your one follow-up question.
 
         Args:
@@ -150,6 +196,16 @@ class RapportAgent(Agent):
             intro_notes: A 2-3 sentence summary of their background and the
                 follow-up answer, for the next interviewer to build on.
         """
+        if self._handed_off:
+            # The fallback timer already forced the transition; this call
+            # arrived too late (e.g. right at the timeout boundary). The
+            # session is already on ExperienceAgent, so there's nothing to do.
+            return None
+        self._handed_off = True
+
+        if self._fallback_timer is not None and not self._fallback_timer.done():
+            self._fallback_timer.cancel()
+
         context.userdata.candidate_name = candidate_name
         context.userdata.intro_notes = intro_notes
 

@@ -21,6 +21,15 @@ working demo + being able to explain every design decision on camera.
 - VAD/turn detection: silero | resume parsing: pdfplumber
 - python-dotenv for secrets
 
+## Progress
+- Stage 1 (voice pipeline) - DONE
+- Stage 2 (RapportAgent -> ExperienceAgent handoff via `intro_complete` function
+  tool + shared `InterviewData`, plus a leak-guard for the 8B model) - DONE
+- Stage 3 (time-based fallback timer, `STAGE1_TIMEOUT_SECS`, logs
+  `trigger=function_call` vs `trigger=timeout`) - DONE
+- Stage 4 (Tavus avatar + frontend) - NEXT
+- See BUILD_PLAN.md for the full stage-by-stage detail.
+
 ## Interview design (the logic)
 - Stage 1 (rapport): opener "tell me about your background" -> ONE follow-up drawn
   ONLY from the candidate's response (NOT the resume) to build comfort -> warm

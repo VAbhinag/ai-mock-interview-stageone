@@ -1,9 +1,14 @@
 # Technical Spec - decide before building
 
 ## Libraries (installed stage by stage, not all at once)
-livekit-agents (done) | livekit-plugins-deepgram | livekit-plugins-google |
-livekit-plugins-cartesia | livekit-plugins-silero | livekit-plugins-tavus |
+livekit-agents (done) | livekit-plugins-deepgram (done) | livekit-plugins-groq (done) |
+livekit-plugins-elevenlabs (done) | livekit-plugins-silero (done) | livekit-plugins-tavus |
 pdfplumber | python-dotenv
+
+Note: LLM started as Gemini/OpenAI in early planning, settled on Groq
+llama-3.1-8b-instant. TTS started as Cartesia, swapped to ElevenLabs
+(eleven_flash_v2_5) after hitting Cartesia free-tier limits mid-Stage-2. The
+pipeline is provider-agnostic by design, so this was a config change only.
 
 ## Avatar (Tavus)
 - Tavus Persona API, low-latency real-time replica (Phoenix-class - pick the
@@ -15,7 +20,7 @@ pdfplumber | python-dotenv
 ## Low-latency techniques (the "algo")
 Target: user stops speaking -> avatar replies under ~1.5s.
 - Cascaded STREAMING pipeline: STT -> LLM -> TTS, every stage streaming.
-- - Fast models: Deepgram nova-3, Gemini 2.0 Flash, Cartesia.
+- Fast models: Deepgram nova-3, Groq llama-3.1-8b-instant, ElevenLabs eleven_flash_v2_5.
 - VAD (Silero) + LiveKit semantic turn detection (waits for real end-of-turn).
 - Preemptive generation: start the reply as the user finishes.
 - Gentle interruption: allow interruptions but set a small min_interruption_duration.
@@ -23,11 +28,16 @@ Target: user stops speaking -> avatar replies under ~1.5s.
 
 ## Other decisions
 - Resume: parse -> summarize to ~5 bullets ONCE on upload; store in state. Optional
-  with graceful fallback.
-- State: one @dataclass (candidate_name, intro_notes, resume_summary,
-  chosen_project, covered_topics), passed across the handoff.
-- Handoff: content-based stage_complete() function + time-based fallback timer
-  (env STAGE1_TIMEOUT_SECS).
+  with graceful fallback. NOT YET BUILT (Stage 5).
+- State: one @dataclass (currently candidate_name, intro_notes - resume_summary,
+  chosen_project, covered_topics land in Stage 5), passed across the handoff.
+- Handoff (done): content-based intro_complete() function tool + time-based
+  fallback timer (env STAGE1_TIMEOUT_SECS, default 90s). Logs trigger=function_call
+  vs trigger=timeout so both paths are demoable.
+- Small-model guard (done): llama-3.1-8b-instant occasionally leaked the
+  intro_complete tool call as spoken text instead of invoking it. Fixed with
+  action-based prompt phrasing (describe the action, not the literal tool name)
+  plus an llm_node() override that strips any leak before it reaches TTS/transcript.
 - Single persona/voice across both stages.
 - Secrets in .env; ship .env.example; never commit .env.
 - Log reply latency + which transition path fired.
