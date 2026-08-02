@@ -39,10 +39,12 @@ from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
     AgentSession,
+    AgentStateChangedEvent,
     JobContext,
     MetricsCollectedEvent,
     ModelSettings,
     RoomInputOptions,
+    RoomOutputOptions,
     RunContext,
     WorkerOptions,
     cli,
@@ -50,19 +52,97 @@ from livekit.agents import (
     llm,
     metrics,
 )
-from livekit.plugins import elevenlabs, deepgram, groq, silero
+from livekit.plugins import elevenlabs, deepgram, groq, silero, tavus
 
 load_dotenv()
 
 logger = logging.getLogger("voice-agent")
 logging.basicConfig(level=logging.INFO)
 
-# Groq's small model occasionally fumbles function calling and writes the
-# tool call out as plain text (e.g. "intro_complete>{...}") instead of a
-# structured tool call. Matches the tool name onward so that leaked text -
-# and anything after it, since it's just JSON garbage - never reaches the
-# transcript or TTS.
-_LEAKED_TOOL_CALL_RE = re.compile(r"\bintro_complete\b.*", re.IGNORECASE | re.DOTALL)
+# Groq's small model occasionally fumbles function calling and writes a tool
+# call out as plain text instead of a structured tool call - sometimes bare
+# ("intro_complete>{...}"), sometimes wrapped ("(function=intro_complete>{...})",
+# "<function=interview_complete>{...}</function>"). This matches the ENTIRE
+# leaked artifact, including any wrapper, so nothing but the tool name onward
+# is left dangling.
+_LEAK_RE = re.compile(
+    r"(?:[\(<]?\s*function\s*=\s*)?\b(?:intro_complete|interview_complete)\b.*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# The leak streams across many small chunks, so a wrapper prefix like
+# "(function=" - or even the tool name itself - can arrive one chunk at a
+# time. This is every literal string a leak could look like WHILE it's still
+# forming (every wrapper variant x both tool names, including no wrapper at
+# all). _suspicious_tail_len() holds back any buffer tail that's a prefix of
+# one of these, however far into the string it's gotten, so a partial leak
+# never gets released before we know whether it's actually going to become
+# one.
+_LEAK_LEAD_INS = tuple(
+    f"{wrapper}{name}"
+    for wrapper in ("", "function=", "(function=", "<function=")
+    for name in ("intro_complete", "interview_complete")
+)
+
+
+def _suspicious_tail_len(text: str) -> int:
+    """Length of the longest tail of `text` that's a case-insensitive prefix
+    of one of `_LEAK_LEAD_INS`. 0 means nothing is ambiguous - the whole
+    text is safe to release.
+    """
+    lowered = text.lower()
+    max_lead_in_len = max(len(lead_in) for lead_in in _LEAK_LEAD_INS)
+    for tail_len in range(min(len(text), max_lead_in_len), 0, -1):
+        tail = lowered[-tail_len:]
+        if any(lead_in.startswith(tail) for lead_in in _LEAK_LEAD_INS):
+            return tail_len
+    return 0
+
+
+async def _filter_leaked_tool_calls(chunks):
+    """Strip a leaked intro_complete/interview_complete tool call (wrapper
+    included) out of a streaming LLM text/ChatChunk stream, without ever
+    emitting a partial one.
+
+    Shared by RapportAgent.llm_node and ExperienceAgent.llm_node so both
+    stay in sync - this only ever touches `.content` text, never the
+    structured `tool_calls` field, so a real tool invocation (or a leaked-
+    but-suppressed one) can never itself trigger a handoff; the handoff
+    still only fires from the actual function_tool call.
+    """
+    held = ""
+    suppressing = False
+    async for chunk in chunks:
+        content = chunk if isinstance(chunk, str) else (chunk.delta.content if chunk.delta else None)
+        if content is None:
+            yield chunk
+            continue
+
+        if suppressing:
+            continue
+
+        combined = held + content
+        match = _LEAK_RE.search(combined)
+        if match:
+            # Confirmed leak: release whatever was clean before it, drop the
+            # leak itself plus the rest of the turn (it's just JSON/tag
+            # garbage from here on).
+            held = ""
+            suppressing = True
+            safe = combined[: match.start()].rstrip()
+            if safe:
+                yield safe
+            continue
+
+        hold_len = _suspicious_tail_len(combined)
+        safe, held = combined[: len(combined) - hold_len], combined[len(combined) - hold_len :]
+        if safe:
+            yield safe
+
+    if held and not suppressing:
+        # Stream ended without ever confirming a leak - whatever's left in
+        # the buffer was just ordinary text that happened to look ambiguous.
+        yield held
 
 # How long RapportAgent waits for the normal intro_complete handoff before
 # forcing the transition itself. Configurable so it can be set short for a
@@ -76,6 +156,7 @@ class InterviewData:
 
     candidate_name: str | None = None
     intro_notes: str | None = None
+    interview_ending: bool = False
 
 
 class RapportAgent(Agent):
@@ -84,9 +165,10 @@ class RapportAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "You are a warm, friendly interviewer conducting the opening, "
-                "rapport-building part of a mock interview. Speak briefly and "
-                "conversationally, this is voice, not text. Never recap or summarize "
+                "Your name is Andrew. You are a warm, friendly interviewer conducting "
+                "the opening, rapport-building part of a mock interview. If asked your "
+                "name, you are Andrew - never introduce yourself as anyone else. Speak "
+                "briefly and conversationally, this is voice, not text. Never recap or summarize "
                 "what the candidate just said back to them - acknowledge it in a few "
                 "words (e.g. \"Got it,\" \"That makes sense,\" \"Interesting -\") and "
                 "move straight to the next question.\n\n"
@@ -107,10 +189,11 @@ class RapportAgent(Agent):
         self._fallback_timer: asyncio.Task[None] | None = None
 
     async def on_enter(self) -> None:
+        logger.info("========== STAGE 1: RAPPORT (background + one follow-up) ==========")
         self.session.generate_reply(
             instructions=(
-                "Greet the candidate warmly, introduce yourself as their interviewer, "
-                "and ask them to tell you about their background."
+                "Greet the candidate warmly, introduce yourself as Andrew, their "
+                "interviewer, and ask them to tell you about their background."
             )
         )
         self._fallback_timer = asyncio.create_task(self._fallback_after_timeout())
@@ -148,38 +231,16 @@ class RapportAgent(Agent):
         tools: list[llm.Tool],
         model_settings: ModelSettings,
     ):
-        """Strip a leaked `intro_complete` tool call out of the text stream.
-
-        This is a belt-and-suspenders guard alongside the instructions above:
-        if the model still writes the tool call as text instead of invoking
-        it, cut it before it reaches the transcript or TTS, so the candidate
-        never hears or sees it. Once the leak starts we suppress the rest of
-        the turn too - the leaked JSON is streamed across many small chunks,
-        and everything after the marker is tool-call plumbing, not something
-        meant for the candidate.
+        """Belt-and-suspenders guard alongside the instructions above: strip a
+        leaked `intro_complete` call (and any wrapper around it) out of the
+        text stream before it reaches the transcript or TTS. See
+        _filter_leaked_tool_calls() for the buffering logic - shared with
+        ExperienceAgent.llm_node so both stay in sync.
         """
-        suppressing = False
-        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
-            content = chunk if isinstance(chunk, str) else (chunk.delta.content if chunk.delta else None)
-            if content is None:
-                yield chunk
-                continue
-
-            if suppressing:
-                continue
-
-            if not _LEAKED_TOOL_CALL_RE.search(content):
-                yield chunk
-                continue
-
-            suppressing = True
-            cleaned = _LEAKED_TOOL_CALL_RE.sub("", content).rstrip()
-            if isinstance(chunk, str):
-                if cleaned:
-                    yield cleaned
-            else:
-                chunk.delta.content = cleaned or None
-                yield chunk
+        async for chunk in _filter_leaked_tool_calls(
+            Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+        ):
+            yield chunk
 
     @function_tool
     async def intro_complete(
@@ -226,8 +287,9 @@ class ExperienceAgent(Agent):
     def __init__(self, intro_notes: str) -> None:
         super().__init__(
             instructions=(
-                "You are the SAME interviewer as before, now moving into the "
-                "experience deep-dive. Here is what you learned about the candidate "
+                "You are Andrew, the SAME interviewer as before, now moving into the "
+                "experience deep-dive. If asked your name, you are Andrew - never "
+                "introduce yourself as anyone else. Here is what you learned about the candidate "
                 f"in the intro, for your own context only: {intro_notes}\n\n"
                 "Do not re-greet the candidate and do not repeat earlier questions. "
                 "Pick up naturally from the transition. Ask the candidate to pick one "
@@ -235,15 +297,57 @@ class ExperienceAgent(Agent):
                 "question about it. Keep replies short and conversational. Never recap "
                 "or summarize what the candidate just said back to them - acknowledge "
                 "it in a few words (e.g. \"Got it,\" \"That makes sense,\" \"Interesting -\") "
-                "and move straight to the next question."
+                "and move straight to the next question.\n\n"
+                "Once the candidate has answered that question, wrap up the interview in "
+                "your final reply, in two short parts: first, ONE brief, warm sentence "
+                "reacting to what they just said (e.g. \"That's a really thoughtful "
+                "point,\" or \"Great, that gives me a good sense of your approach,\") - "
+                "not a summary, just a quick natural acknowledgment. Then immediately "
+                "follow with the closing line: \"That's all my questions. Thank you so "
+                "much for your time today - this concludes our interview, and best of "
+                "luck.\" Do not ask any further questions after that. Ending the "
+                "interview itself happens as a background action - you don't need to "
+                "mention a function, tool, or action, just speak the acknowledgment and "
+                "closing naturally as your last turn.\n\n"
+                "Your spoken replies should only ever be natural interview conversation. "
+                "Never write out code, JSON, or any programming syntax in your reply."
             )
         )
 
     async def on_enter(self) -> None:
+        logger.info("========== STAGE 2: EXPERIENCE (project deep-dive) ==========")
         # No explicit instructions: the chat history already has the rapport
         # conversation plus the handoff's transition line, so the model
         # continues naturally instead of restarting the conversation.
         self.session.generate_reply()
+
+    async def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: list[llm.Tool],
+        model_settings: ModelSettings,
+    ):
+        """Same belt-and-suspenders guard as RapportAgent.llm_node, for a
+        leaked `interview_complete` call - see _filter_leaked_tool_calls()
+        for the shared buffering logic.
+        """
+        async for chunk in _filter_leaked_tool_calls(
+            Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+        ):
+            yield chunk
+
+    @function_tool
+    async def interview_complete(self, context: RunContext[InterviewData]) -> str:
+        """Call this once the candidate has answered your question about their
+        chosen project. This ends the interview - do not call it before they've
+        answered, and do not call it more than once.
+        """
+        context.userdata.interview_ending = True
+        logger.info("interview complete")
+        return (
+            "Wrap up now: thank the candidate warmly for their time and interest, "
+            "wish them well, and end on a positive note. Do not ask any more questions."
+        )
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -252,7 +356,7 @@ async def entrypoint(ctx: JobContext) -> None:
         userdata=userdata,
         stt=deepgram.STT(model="nova-3"),
         llm=groq.LLM(model="llama-3.1-8b-instant"),
-        tts=elevenlabs.TTS(model="eleven_flash_v2_5"),
+        tts=elevenlabs.TTS(model="eleven_flash_v2_5", voice_id="pNInz6obpgDQGcFmaJgB"),
         vad=silero.VAD.load(),
     )
 
@@ -262,15 +366,42 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_metrics(ev: MetricsCollectedEvent) -> None:
         metrics.log_metrics(ev.metrics)
 
+    # ExperienceAgent.interview_complete() sets userdata.interview_ending and
+    # triggers a closing reply, but that reply still needs to finish playing
+    # before we actually end the job. "speaking" -> anything else is the
+    # signal that the closing statement has finished, so this is the one
+    # spot that's actually safe to shut down from.
+    shutdown_requested = False
+
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(ev: AgentStateChangedEvent) -> None:
+        nonlocal shutdown_requested
+        if shutdown_requested or not userdata.interview_ending:
+            return
+        if ev.old_state == "speaking":
+            shutdown_requested = True
+            logger.info("closing statement finished playing - ending session")
+            ctx.shutdown(reason="interview complete")
+
     # Connect before starting the session: RapportAgent's on_enter() fires a
     # greeting as soon as the session starts, so the room needs to already be
     # connected for that first reply to have somewhere to go.
     await ctx.connect()
 
+    # Tavus renders the avatar as its own room participant and plays the
+    # audio itself, so the agent's own audio output must be disabled below
+    # (room_output_options) to avoid double-playback.
+    avatar = tavus.AvatarSession(
+        replica_id=os.getenv("TAVUS_REPLICA_ID"),
+        # persona_id omitted on purpose - let the plugin use its default LiveKit PAL
+    )
+    await avatar.start(session, room=ctx.room)
+
     await session.start(
         room=ctx.room,
         agent=RapportAgent(),
         room_input_options=RoomInputOptions(),
+        room_output_options=RoomOutputOptions(audio_enabled=False),
     )
 
 
